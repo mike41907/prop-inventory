@@ -1,0 +1,6 @@
+# 不要把清冊或備份檔上傳到這個公開 repo
+*.xls
+*.xlsx
+*.csv
+*.json
+*.pdf

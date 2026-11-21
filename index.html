@@ -388,7 +388,8 @@ async function setPhoto(key, dataUrl) {
 async function delPhoto(key) { photoCache.delete(key); photoKeys.delete(key); await DB.del('photos', key).catch(() => {}); }
 function hydratePhotos(root = document) {
   $$('[data-ph]', root).forEach(async el => {
-    const k = el.dataset.ph; const u = await getPhoto(k);
+    const k = el.dataset.ph; let u = await getPhoto(k);
+    if (!u && !k.includes('#') && el.dataset.exact === undefined) u = await getPhoto(LK(k));
     if (u) { el.style.backgroundImage = `url("${u}")`; el.innerHTML = ''; }
   });
 }
@@ -401,7 +402,15 @@ const loc = it => (S.alias[it.place] ?? it.place) || '（未填地點）';
 const rocYear = s => { s = String(s || ''); return /^\d{6,7}$/.test(s) ? Number(s.slice(0, -4)) : null; };
 const dueYear = it => { const y = rocYear(it.buy); const l = Number(it.life); return y && l ? y + l : null; };
 const isOverdue = it => it.type === 'asset' && dueYear(it) && dueYear(it) <= S.settings.year;
-const hasPhoto = it => photoKeys.has(it.key);
+const LK = key => key + '#label';
+const hasPhoto = it => photoKeys.has(it.key) && photoKeys.has(LK(it.key));
+const hasItemPhoto = it => photoKeys.has(it.key);
+const hasLabelPhoto = it => photoKeys.has(LK(it.key));
+const thumbUrl = key => photoCache.get(key) || photoCache.get(LK(key));
+async function saveLabelPhotoIfNone(it, file) {
+  if (!it || hasLabelPhoto(it) || !file) return;
+  try { await setPhoto(LK(it.key), await shrinkImage(file)); toast('這張照片已存成標籤照', 'ok'); } catch (e) {}
+}
 
 function stats(items = S.items) {
   const s = { total: items.length, ok: 0, bad: 0, todo: 0, noSpot: 0, noPhoto: 0, labelBad: 0, overdue: 0 };
@@ -409,6 +418,8 @@ function stats(items = S.items) {
     if (i.status === '相符') s.ok++; else if (i.status === '不符') s.bad++; else s.todo++;
     if (!i.spot) s.noSpot++;
     if (!hasPhoto(i)) s.noPhoto++;
+    if (!hasItemPhoto(i)) s.noItemPh = (s.noItemPh || 0) + 1;
+    if (!hasLabelPhoto(i)) s.noLabelPh = (s.noLabelPh || 0) + 1;
     if (i.label === '需補貼') s.labelBad++;
     if (isOverdue(i)) s.overdue++;
   });
@@ -665,6 +676,36 @@ const OCR = {
     })().catch(e => { this.loading = null; throw e; });
     return this.loading;
   },
+  /* 兩段式：先整塊讀、找出編號那一行，再把那一行放大單獨重讀 */
+  async scan(cv) {
+    const w = await this.get();
+    const { data } = await w.recognize(cv);
+    let hit = null;
+    for (const l of (data.lines || [])) {
+      const m = (l.text || '').replace(/[^\d-]/g, '').match(/\d{7}-?\d{4}-?\d{7}/);
+      if (m) { hit = { line: l, d1: m[0].replace(/\D/g, '') }; break; }
+    }
+    if (!hit) return { text: data.text || '' };
+    const b = hit.line.bbox, h = b.y1 - b.y0, pad = Math.max(4, h * 0.45);
+    const x0 = Math.max(0, b.x0 - pad), y0 = Math.max(0, b.y0 - pad), x1 = Math.min(cv.width, b.x1 + pad), y1 = Math.min(cv.height, b.y1 + pad);
+    const sc = Math.max(1, Math.min(4, 72 / Math.max(8, h)));
+    const lc = document.createElement('canvas'); lc.width = Math.round((x1 - x0) * sc); lc.height = Math.round((y1 - y0) * sc);
+    const lx = lc.getContext('2d', { willReadFrequently: true }); lx.imageSmoothingQuality = 'high'; lx.drawImage(cv, x0, y0, x1 - x0, y1 - y0, 0, 0, lc.width, lc.height);
+    const snippet = lc.toDataURL('image/jpeg', .85);
+    const pick = t => { const m = (t || '').replace(/[^\d-]/g, '').match(/\d{7}-?\d{4}-?\d{7}/); return m ? m[0].replace(/\D/g, '') : null; };
+    const reads = [hit.d1];
+    try {
+      await w.setParameters({ tessedit_pageseg_mode: '7' });
+      reads.push(pick((await w.recognize(lc)).data.text));
+      const bc = document.createElement('canvas'); bc.width = lc.width; bc.height = lc.height; bc.getContext('2d').drawImage(lc, 0, 0); otsu(bc);
+      reads.push(pick((await w.recognize(bc)).data.text));
+    } finally { await w.setParameters({ tessedit_pageseg_mode: '6' }); }
+    const ok = reads.filter(x => x && x.length === 18);
+    // 逐位投票
+    let d = ok[0];
+    if (ok.length >= 2) d = [...Array(18)].map((_, k) => { const c = {}; ok.forEach(x => c[x[k]] = (c[x[k]] || 0) + 1); return Object.entries(c).sort((a, b) => b[1] - a[1] || (a[0] === ok[0][k] ? -1 : 1))[0][0]; }).join('');
+    return { text: data.text || '', d, reads: [...new Set(ok)], agree: ok.length >= 2 && ok.every(x => x === ok[0]), snippet };
+  },
   async read(img, psm = '6') {
     const w = await this.get();
     if (psm !== '6') await w.setParameters({ tessedit_pageseg_mode: psm });
@@ -672,6 +713,34 @@ const OCR = {
     finally { if (psm !== '6') await w.setParameters({ tessedit_pageseg_mode: '6' }); }
   },
 };
+function otsu(cv) {
+  const ctx = cv.getContext('2d', { willReadFrequently: true }); const d = ctx.getImageData(0, 0, cv.width, cv.height); const p = d.data; const hist = new Array(256).fill(0); const n = p.length / 4;
+  for (let i = 0; i < p.length; i += 4) { const g = (p[i] * .299 + p[i + 1] * .587 + p[i + 2] * .114) | 0; p[i] = g; hist[g]++; }
+  let sum = 0; for (let k = 0; k < 256; k++) sum += k * hist[k];
+  let sB = 0, wB = 0, best = 0, th = 128;
+  for (let k = 0; k < 256; k++) { wB += hist[k]; if (!wB) continue; const wF = n - wB; if (!wF) break; sB += k * hist[k]; const mB = sB / wB, mF = (sum - sB) / wF; const v = wB * wF * (mB - mF) * (mB - mF); if (v > best) { best = v; th = k; } }
+  for (let i = 0; i < p.length; i += 4) { const v = p[i] > th ? 255 : 0; p[i] = p[i + 1] = p[i + 2] = v; }
+  ctx.putImageData(d, 0, 0);
+}
+const fmtD = d => d && d.length === 18 ? `${d.slice(0, 7)}-${d.slice(7, 11)}-${d.slice(11)}` : (d || '');
+/* 讀到的 18 碼 → 清冊候選：完全相同 + 同類別同分號、只差一碼或流水號相近的 */
+function ocrCandidates(d, reads = []) {
+  const all = [...new Set([d, ...reads].filter(x => x && x.length === 18))];
+  if (!all.length) return [];
+  const score = new Map();
+  all.forEach((q, qi) => {
+    const n = Number(q.slice(11));
+    S.items.forEach(i => {
+      if (i.digits.length !== 18) return;
+      let diff = 0; for (let k = 0; k < 18; k++) if (i.digits[k] !== q[k]) diff++;
+      const samePre = i.digits.slice(0, 11) === q.slice(0, 11);
+      const dist = samePre ? Math.abs(Number(i.digits.slice(11)) - n) : 99;
+      if (diff <= 2 || dist <= 2) { const sc = Math.min(diff, dist) + (qi ? 0.3 : 0); if (!score.has(i.key) || score.get(i.key)[0] > sc) score.set(i.key, [sc, i]); }
+    });
+  });
+  return [...score.values()].sort((a, b) => a[0] - b[0]).slice(0, 6).map(x => x[1]);
+}
+const diffMark = (cand, read) => { const a = fmtD(cand), b = fmtD(read); return [...a].map((ch, k) => ch !== b[k] ? `<b style="color:var(--bad);text-decoration:underline">${esc(ch)}</b>` : esc(ch)).join(''); };
 /* 從 OCR 文字找財產：先精確比對，再找只差 1 碼的 */
 function ocrMatch(text) {
   const lines = String(text || '').split(/\n/).map(l => l.replace(/[^\d-]/g, '')).filter(l => l.replace(/\D/g, '').length >= 11);
@@ -738,16 +807,13 @@ const Scan = {
     if (!OCR.available()) return { none: true, reason: 'nocr' };
     status && status('條碼讀不到，改讀編號文字…');
     try {
-      const tries = [[null, '6'], [[0.1, 0.15, 0.8, 0.7], '6'], [[0.05, 0.05, 0.9, 0.5], '6'], [[0.05, 0.45, 0.9, 0.5], '6'], [null, '11']];
-      let text = '', best = null;
-      for (const [crop, psm] of tries) {
+      const tries = [null, [0.1, 0.15, 0.8, 0.7], [0.05, 0.05, 0.9, 0.5], [0.05, 0.45, 0.9, 0.5]];
+      for (const crop of tries) {
         status && status('條碼讀不到，改讀編號文字…');
-        const t = await OCR.read(grayCanvas(img, 1800, crop), psm); text += '\n' + t;
-        const r = ocrMatch(t);
-        if (r.exact.length) return { ...r, text, via: '文字' };
-        if (!best || (r.fuzzy.length && !best.fuzzy.length) || (!best.code && r.code)) best = r;
+        const r = await OCR.scan(grayCanvas(img, 1800, crop));
+        if (r.d) return { ocr: r, via: '文字' };
       }
-      return { ...best, text, via: '文字' };
+      return { none: true };
     } catch (e) { return { none: true, reason: e.message }; }
   },
   /* opts: {title, continuous, onCode(code, log)} */
@@ -756,6 +822,7 @@ const Scan = {
       title: opts.title || '掃描條碼',
       body: `<div class="scan-view" id="sc-view"><video id="sc-v" playsinline muted></video><div class="frame"></div><div class="laser"></div>
           <div class="sc-tools"><button class="btn sm" id="sc-torch" hidden>🔦 閃光燈</button><input type="range" id="sc-zoom" hidden></div></div>
+        <div id="sc-confirm" class="card" hidden style="margin-top:12px;padding:14px;border-color:var(--gold)"></div>
         <div id="sc-msg" class="small muted" style="margin-top:10px">把<b>條碼</b>或<b>「財產編號」那一行字</b>對準框內，拿穩一兩秒…</div>
         <div class="row" style="margin-top:12px">
           <label class="btn">${ic('cam')}拍照辨識<input type="file" accept="image/*" capture="environment" id="sc-file" hidden></label>
@@ -768,8 +835,9 @@ const Scan = {
     this.modal = m; this.last = { code: '', t: 0 };
     const msg = $('#sc-msg', m);
     const log = (txt, ok = true) => { const l = $('#sc-log', m); if (l) l.insertAdjacentHTML('afterbegin', `<div class="chip ${ok ? 'ok' : 'bad'}" style="justify-content:flex-start;white-space:normal">${ic(ok ? 'ok' : 'x')}${esc(txt)}</div>`); };
-    const handle = code => {
+    const handle = (code, photo) => {
       code = String(code || '').trim(); if (!code) return;
+      if (photo) { const m1 = matchCode(code); if (m1.length === 1) saveLabelPhotoIfNone(m1[0], photo); }
       const now = Date.now();
       if (code === this.last.code && now - this.last.t < 2500) return;
       this.last = { code, t: now };
@@ -787,15 +855,10 @@ const Scan = {
       const f = e.target.files[0]; e.target.value = ''; if (!f) return;
       msg.textContent = '辨識中…';
       const r = await this.decodeFile(f, t => { msg.textContent = t; });
-      if (r.code && r.via === '條碼') { msg.textContent = '條碼辨識成功'; return handle(r.code); }
-      if (r.exact && r.exact.length) { msg.textContent = `讀到編號 ${r.code}`; return handle(r.exact[0].key); }
-      if (r.fuzzy && r.fuzzy.length) {
-        msg.textContent = `讀到 ${r.code}，可能有一碼看錯，請確認`;
-        return pickItem({ title: `讀到「${r.code}」，是這一件嗎？`, code: r.code, preset: r.fuzzy, onPick: it => handle(it.key) });
-      }
+      if (r.code && r.via === '條碼') { msg.textContent = '條碼辨識成功'; return handle(r.code, f); }
+      if (r.ocr) { msg.textContent = '請核對編號'; return this.confirm(r.ocr, handle, f); }
       beep(false);
       if (r.reason === 'nocr') msg.innerHTML = '<span style="color:var(--bad)">讀不到條碼。電腦版沒有文字辨識，請直接輸入編號末幾碼。</span>';
-      else if (r.code) msg.innerHTML = `<span style="color:var(--bad)">讀到「${esc(r.code)}」，但清冊裡沒有這個編號（可能不屬本單位，或字沒拍清楚）。</span>`;
       else msg.innerHTML = '<span style="color:var(--bad)">沒讀到編號。請靠近一點、讓「財產編號」那一行清楚對焦、避免反光再拍一次，或直接輸入編號末幾碼。</span>';
     });
     if (OCR.available() && !OCR.worker) {
@@ -833,19 +896,14 @@ const Scan = {
         const cw = vw * 0.92, ch = vh * 0.7, sx = (vw - cw) / 2, sy = (vh - ch) / 2;
         const sc = Math.min(1, 1400 / cw); cv.width = Math.round(cw * sc); cv.height = Math.round(ch * sc);
         ctx.drawImage(video, sx, sy, cw, ch, 0, 0, cv.width, cv.height);
-        const code = await this.barcodeFromCanvas(cv, det);
+        const code = this.paused ? null : await this.barcodeFromCanvas(cv, det);
         if (code) handle(code);
-        else if (OCR.worker && !OCR.busy && Date.now() - lastOcr > 700) {
+        else if (!this.paused && OCR.worker && !OCR.busy && Date.now() - lastOcr > 700) {
           lastOcr = Date.now(); OCR.busy = true;
           const g = grayCanvas(cv, 1400);
-          OCR.read(g).then(text => {
-            if (!this.running) return;
-            const r = ocrMatch(text);
-            if (r.exact.length === 1) handle(r.exact[0].key);
-            else if (r.code && /\d{7}-?\d{4}-?\d{7}/.test(r.code) && r.code !== lastMiss) {
-              lastMiss = r.code;
-              msg.innerHTML = r.fuzzy.length ? `讀到 ${esc(r.code)}，還不確定，請再對準一點…` : `讀到 ${esc(r.code)}，但清冊裡沒有（不屬本單位或字沒讀清楚）`;
-            }
+          OCR.scan(g).then(r => {
+            if (!this.running || this.paused || !r.d) return;
+            this.confirm(r, handle);
           }).catch(() => {}).finally(() => { OCR.busy = false; });
         }
       }
@@ -853,11 +911,34 @@ const Scan = {
     };
     loop();
   },
+  /* 文字辨識結果一律讓使用者核對後才採用 */
+  confirm(r, handle, photo) {
+    const box = $('#sc-confirm', this.modal); if (!box) return;
+    this.paused = true; beep(true);
+    const cands = ocrCandidates(r.d, r.reads);
+    const resume = (delay = 0) => { box.hidden = true; box.innerHTML = ''; setTimeout(() => { this.paused = false; }, delay); };
+    box.innerHTML = `<div class="row" style="margin-bottom:8px"><b class="grow">請核對標籤上的編號</b><span class="chip ${r.agree ? 'ok' : 'warn'}">${r.agree ? '兩次讀法一致' : '讀法不確定'}</span></div>
+      <img src="${r.snippet}" alt="" style="width:100%;max-height:90px;object-fit:contain;background:#fff;border-radius:8px;border:1px solid var(--line)">
+      <div class="small muted" style="margin:8px 0 10px">系統讀到：<b class="mono" style="font-size:15px;color:var(--text)">${esc(fmtD(r.d))}</b>${!r.agree && (r.reads || []).length > 1 ? `<br>各次讀法：${r.reads.map(x => `<span class="mono">${esc(fmtD(x))}</span>`).join('、')}` : ''}</div>
+      ${cands.length ? `<div class="small muted" style="margin-bottom:6px">跟上面的圖比對，點<b>標籤上實際的那一個</b>（紅字是跟系統讀到的不同處）：</div>
+        <div class="items">${cands.map(i => `<button class="it" data-pick="${esc(i.key)}" style="text-align:left;width:100%"><div class="bd"><div class="mono" style="font-size:16px;font-weight:600">${diffMark(i.digits, r.d)}</div>
+          <div class="meta"><span>${esc(i.alias || i.name)}</span><span>${esc(loc(i))}</span><span>${esc(i.keeper)}</span>${i.status === '相符' ? '<span class="chip ok">已打勾</span>' : ''}</div></div></button>`).join('')}</div>`
+        : `<div class="note warn">清冊裡沒有這個編號，也沒有相近的編號（可能不屬本單位，或字沒讀清楚）。</div>`}
+      <div class="row" style="margin-top:10px"><button class="btn sm" id="cf-retry">重新讀取</button><button class="btn sm ghost" id="cf-search">都不是，手動搜尋</button></div>`;
+    box.hidden = false; box.scrollIntoView({ block: 'nearest' });
+    box.onclick = e => {
+      const p = e.target.closest('[data-pick]');
+      if (p) { const k = p.dataset.pick; resume(1800); this.last = { code: '', t: 0 }; return handle(k, photo); }
+      if (e.target.closest('#cf-retry')) return resume(300);
+      if (e.target.closest('#cf-search')) { resume(1800); return pickItem({ title: '選擇項目', code: fmtD(r.d), preset: cands, onPick: it => handle(it.key, photo) }); }
+    };
+  },
   noLive(msg) {
     const v = $('#sc-view', this.modal); if (v) v.style.display = 'none';
     if (msg) msg.innerHTML = '這個瀏覽器無法直接開啟相機（常見於用檔案方式開啟或公務電腦）。請用<b>「拍照辨識」</b>，或直接輸入編號末幾碼。';
   },
   stop() {
+    this.paused = false;
     this.stopped = true; this.running = false; clearTimeout(this.timer);
     if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
   },
@@ -883,7 +964,7 @@ function quickOk(it, code, log) {
   const was = it.status;
   setStatus(it, '相符', it.label === '需補貼' ? {} : { label: '完好' });
   beep(true);
-  const txt = `${it.alias || it.name}　${loc(it)}${was === '相符' ? '（先前已打勾）' : ' ✓ 已打勾'}`;
+  const txt = `${it.alias || it.name}（…${it.key.slice(-7)}）　${loc(it)}${was === '相符' ? '（先前已打勾）' : ' ✓ 已打勾'}`;
   log ? log(txt) : toast('✓ ' + txt, 'ok');
   if (VIEW === 'check') renderCheck(true);
 }
@@ -953,9 +1034,11 @@ function openItem(key) {
     title: esc(it.alias || it.name), wide: true,
     body: `<div class="grid g2" style="align-items:start">
       <div>
-        <div class="photo-lg" id="d-ph" data-ph="${esc(it.key)}">${ic('img')} 尚無照片</div>
-        <div class="row" style="margin-top:10px"><label class="btn sm">${ic('cam')}拍照／換照片<input type="file" accept="image/*" capture="environment" id="d-file" hidden></label>
-          <button class="btn sm danger" id="d-delph" ${hasPhoto(it) ? '' : 'disabled'}>${ic('trash')}刪除照片</button></div>
+        <div class="grid g2" style="gap:10px">${[['item', '物品照', it.key], ['label', '標籤照', LK(it.key)]].map(([slot, t, k]) => `<div>
+          <div class="small muted" style="margin-bottom:4px">${t}</div>
+          <div class="photo-lg" data-slot="${slot}" data-ph="${esc(k)}" data-exact style="aspect-ratio:1/1">${ic('cam')}<span class="small">尚未拍照</span></div>
+          <div class="row" style="margin-top:6px;gap:6px"><label class="btn sm">${ic('cam')}拍照<input type="file" accept="image/*" capture="environment" data-shoot="${slot}" hidden></label>
+          <button class="btn sm danger icon" data-delph="${slot}" ${photoKeys.has(k) ? '' : 'disabled'} title="刪除">${ic('trash')}</button></div></div>`).join('')}</div>
         <hr class="sep">
         <dl class="kv">
           <dt>清冊</dt><dd>${TYPE_LABEL[it.type]}</dd>
@@ -1008,12 +1091,19 @@ function openItem(key) {
     const b = e.target.closest('button'); if (!b) return; it.label = b.dataset.v; sv();
     $$('#d-lb button', m).forEach(x => x.className = x === b ? 'on ' + (b.dataset.v === '完好' ? 'ok' : b.dataset.v === '需補貼' ? 'warn' : '') : '');
   });
-  $('#d-file', m).addEventListener('change', async e => {
+  const slotKey = slot => slot === 'label' ? LK(it.key) : it.key;
+  m.addEventListener('change', async e => {
+    const slot = e.target.dataset.shoot; if (!slot) return;
     const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-    const u = await shrinkImage(f); await setPhoto(it.key, u);
-    const ph = $('#d-ph', m); ph.style.backgroundImage = `url("${u}")`; ph.innerHTML = ''; $('#d-delph', m).disabled = false; toast('照片已儲存', 'ok');
+    const u = await shrinkImage(f); await setPhoto(slotKey(slot), u);
+    const ph = $(`[data-slot="${slot}"]`, m); ph.style.backgroundImage = `url("${u}")`; ph.innerHTML = ''; $(`[data-delph="${slot}"]`, m).disabled = false;
+    toast((slot === 'label' ? '標籤照' : '物品照') + '已儲存', 'ok');
   });
-  $('#d-delph', m).onclick = async () => { if (!(await ask('確定刪除這張照片？', { danger: true, ok: '刪除' }))) return; await delPhoto(it.key); const ph = $('#d-ph', m); ph.style.backgroundImage = ''; ph.innerHTML = ic('img') + ' 尚無照片'; $('#d-delph', m).disabled = true; };
+  m.addEventListener('click', async e => {
+    const b = e.target.closest('[data-delph]'); if (!b) return; const slot = b.dataset.delph;
+    if (!(await ask(`確定刪除這張${slot === 'label' ? '標籤照' : '物品照'}？`, { danger: true, ok: '刪除' }))) return;
+    await delPhoto(slotKey(slot)); const ph = $(`[data-slot="${slot}"]`, m); ph.style.backgroundImage = ''; ph.innerHTML = ic('cam') + '<span class="small">尚未拍照</span>'; b.disabled = true;
+  });
   m.addEventListener('click', e => { const b = e.target.closest('[data-addchg]'); if (!b) return; closeModal(m); addToChange(b.dataset.addchg, [it.key]); });
   $('#d-bind', m).onclick = () => Scan.open({ title: '掃描這件的標籤條碼', onCode: c => { const mm = matchCode(c); if (mm.length === 1 && mm[0] === it) toast('條碼本來就對得到這一項', 'ok'); else { bindBarcode(it, c); toast('已綁定條碼 ' + c, 'ok'); } } });
 }
@@ -1102,7 +1192,7 @@ function renderDash() {
       <div class="kpi bad click" data-go="不符"><div class="k">盤點不符</div><div class="v">${s.bad}<small>件</small></div><div class="d">找不到、位置或保管人不同</div></div>
       <div class="kpi warn click" data-go="需補貼"><div class="k">標籤需補貼</div><div class="v">${s.labelBad}<small>件</small></div><div class="d">抽查前要先補好</div></div>
       <div class="kpi click" data-go="無位置"><div class="k">還沒填精確位置</div><div class="v">${s.noSpot}<small>件</small></div><div class="d">填了抽查時才找得快</div></div>
-      <div class="kpi click" data-go="無照片"><div class="k">還沒拍照</div><div class="v">${s.noPhoto}<small>件</small></div><div class="d">照片讓別人也認得出來</div></div>
+      <div class="kpi click" data-go="無照片"><div class="k">照片沒拍齊</div><div class="v">${s.noPhoto}<small>件</small></div><div class="d">缺物品照 ${s.noItemPh || 0}・缺標籤照 ${s.noLabelPh || 0}；照片讓別人也認得出來</div></div>
     </div>
     <div class="grid g2" style="margin-top:14px">
       <div class="kpi gold click" data-go="逾年限"><div class="k">已逾使用年限的財產（可評估報廢）</div><div class="v">${s.overdue}<small>件</small></div><div class="d">東西少了，每年要盤的就少了</div></div>
@@ -1396,10 +1486,10 @@ function idxRows(withPhoto) {
   return rooms().sort((a, b) => a.name.localeCompare(b.name, 'zh-Hant')).map(r => {
     const list = r.list.slice().sort((a, b) => (a.spot || '').localeCompare(b.spot || '', 'zh-Hant'));
     return `<div class="grp">${esc(r.name)}（${list.length} 件）</div><table><thead><tr>${withPhoto ? '<th style="width:30mm">照片</th>' : ''}<th>精確位置</th><th>名稱／別名</th><th>財產編號</th><th>型式</th><th>保管人</th><th>標籤</th><th>盤點</th></tr></thead><tbody>
-      ${list.map(i => `<tr>${withPhoto ? `<td>${photoCache.get(i.key) ? `<img class="ph" src="${photoCache.get(i.key)}">` : ''}</td>` : ''}<td class="big">${esc(i.spot)}</td><td class="big">${esc(i.alias || i.name)}<br><small>${esc(i.name)}</small></td><td>${esc(i.key)}</td><td>${esc(i.model)}</td><td>${esc(i.keeper)}</td><td>${esc(i.label)}</td><td>${esc(i.status)}</td></tr>`).join('')}</tbody></table>`;
+      ${list.map(i => `<tr>${withPhoto ? `<td>${thumbUrl(i.key) ? `<img class="ph" src="${thumbUrl(i.key)}">` : ''}</td>` : ''}<td class="big">${esc(i.spot)}</td><td class="big">${esc(i.alias || i.name)}<br><small>${esc(i.name)}</small></td><td>${esc(i.key)}</td><td>${esc(i.model)}</td><td>${esc(i.keeper)}</td><td>${esc(i.label)}</td><td>${esc(i.status)}</td></tr>`).join('')}</tbody></table>`;
   }).join('');
 }
-async function preloadPhotos(keys) { for (const k of keys) await getPhoto(k); }
+async function preloadPhotos(keys) { for (const k of keys) { await getPhoto(k); await getPhoto(LK(k)); } }
 async function printIndex(withPhoto) {
   if (withPhoto) { toast('準備照片中…'); await preloadPhotos(S.items.map(i => i.key)); }
   doPrint(`<h1>${esc(S.settings.unitName || S.settings.unitKw)} 財產位置索引</h1><h2>${S.settings.year} 年度・列印日期 ${rocDate()}・共 ${S.items.length} 件</h2>${idxRows(withPhoto)}`);
@@ -1409,7 +1499,7 @@ async function printAudit(a) {
   const groups = auditGroups(a);
   doPrint(`<h1>${esc(a.name)}・帶看準備單</h1><h2>${esc(a.date || '')}　共 ${a.entries.length} 項・${groups.length} 個地點（依路線排序）</h2>
     ${groups.map(([l, list], gi) => `<div class="grp">${gi + 1}. ${esc(l)}</div><table><thead><tr><th style="width:30mm">照片</th><th>精確位置</th><th>名稱／別名</th><th>財產編號</th><th>保管人</th><th>標籤</th><th>盤點</th><th style="width:16mm">預查</th><th style="width:16mm">帶看</th></tr></thead><tbody>
-    ${list.map(({ e, it }) => it ? `<tr><td>${photoCache.get(it.key) ? `<img class="ph" src="${photoCache.get(it.key)}">` : ''}</td><td class="big"><b>${esc(it.spot)}</b></td><td class="big">${esc(it.alias || it.name)}<br><small>${esc(it.name)} ${esc(it.model)}</small></td><td>${esc(it.key)}</td><td>${esc(it.keeper)}</td><td>${esc(it.label)}</td><td>${esc(it.status)}${it.checkedAt ? '<br><small>' + fmtTime(it.checkedAt) + '</small>' : ''}</td><td>${e.prep ? '■' : '□'}</td><td>${e.shown ? '■' : '□'}</td></tr>` : `<tr><td colspan="9">對不到清冊：${esc(e.text)}</td></tr>`).join('')}</tbody></table>`).join('')}`);
+    ${list.map(({ e, it }) => it ? `<tr><td>${thumbUrl(it.key) ? `<img class="ph" src="${thumbUrl(it.key)}">` : ''}</td><td class="big"><b>${esc(it.spot)}</b></td><td class="big">${esc(it.alias || it.name)}<br><small>${esc(it.name)} ${esc(it.model)}</small></td><td>${esc(it.key)}</td><td>${esc(it.keeper)}</td><td>${esc(it.label)}</td><td>${esc(it.status)}${it.checkedAt ? '<br><small>' + fmtTime(it.checkedAt) + '</small>' : ''}</td><td>${e.prep ? '■' : '□'}</td><td>${e.shown ? '■' : '□'}</td></tr>` : `<tr><td colspan="9">對不到清冊：${esc(e.text)}</td></tr>`).join('')}</tbody></table>`).join('')}`);
 }
 function simpleTable(title, list, extra = []) {
   return `<div class="grp">${title}（${list.length}）</div>${list.length ? `<table><thead><tr><th>財產編號</th><th>名稱／別名</th><th>存置地點</th><th>精確位置</th><th>保管人</th>${extra.map(x => `<th>${x[0]}</th>`).join('')}<th>備註</th></tr></thead><tbody>
@@ -1978,14 +2068,24 @@ async function exportWord(c) {
       const meta = `財產編號：${it.key}　存置地點：${loc(it)}${it.spot ? '／' + it.spot : ''}　保管人：${it.keeper}　${chgAge(c.type) ? '購置：' + fmtBuy(it.buy) + '　年限：' + it.life + '年　' : ''}${RL[c.type]}：${r.reason || ''}${c.type === 'replace' && r.newSpec ? '　擬購：' + r.newSpec : ''}`;
       ch.push(P(cap, { size: 26, bold: true, after: 40, keepNext: true }));
       ch.push(P(meta, { size: 22, after: 80, keepNext: true, line: 300 }));
-      if (u) {
-        const [w, h] = await imgSize(u); const maxW = 520, maxH = 330;
-        const sc = Math.min(maxW / w, maxH / h);
-        ch.push(new D.Paragraph({ alignment: D.AlignmentType.CENTER, spacing: { after: 320 }, children: [new D.ImageRun({ type: 'jpg', data: dataUrlBytes(u), transformation: { width: Math.round(w * sc), height: Math.round(h * sc) } })] }));
+      const ul = await getPhoto(LK(it.key));
+      const pics = [[u, '物品照'], [ul, '標籤照']];
+      if (u || ul) {
+        const cells = [];
+        for (const [src, t] of pics) {
+          const kids = [];
+          if (src) { const [w, h] = await imgSize(src); const sc = Math.min(270 / w, 260 / h); kids.push(new D.Paragraph({ alignment: D.AlignmentType.CENTER, children: [new D.ImageRun({ type: 'jpg', data: dataUrlBytes(src), transformation: { width: Math.round(w * sc), height: Math.round(h * sc) } })] })); }
+          else kids.push(P('（尚未拍照）', { size: 22, align: D.AlignmentType.CENTER }));
+          kids.push(P(t, { size: 22, align: D.AlignmentType.CENTER, after: 0 }));
+          cells.push(new D.TableCell({ width: { size: 4500, type: D.WidthType.DXA }, borders: { top: { style: D.BorderStyle.NONE }, left: { style: D.BorderStyle.NONE }, right: { style: D.BorderStyle.NONE }, bottom: { style: D.BorderStyle.NONE } }, children: kids }));
+        }
+        ch.push(new D.Table({ width: { size: 9000, type: D.WidthType.DXA }, columnWidths: [4500, 4500], layout: D.TableLayoutType.FIXED, borders: D.TableBorders.NONE, rows: [new D.TableRow({ cantSplit: true, children: cells })] }));
+        ch.push(P('', { after: 240 }));
+        if (!u || !ul) noPhoto++;
       } else { noPhoto++; ch.push(P('（尚未拍照）', { size: 24, after: 320 })); }
     }
     sections.push({ properties: { page: { size: { width: 11906, height: 16838 }, margin: { top: 1200, bottom: 1200, left: 1400, right: 1400 } } }, children: ch });
-    if (noPhoto) toast(`有 ${noPhoto} 件還沒拍照，Word 裡會顯示「尚未拍照」`, 'bad');
+    if (noPhoto) toast(`有 ${noPhoto} 件照片沒拍齊（物品照或標籤照），Word 裡會顯示「尚未拍照」`, 'bad');
   }
 
   const doc = new D.Document({ creator: '財產盤點系統', title: T.title, styles: { default: { document: { run: { font: FONT } } } }, sections });
@@ -2027,7 +2127,7 @@ function renderList(soft) {
     $('#ls-cnt').textContent = `${cur.length} 件`;
     $('#ls-body').innerHTML = cur.map(i => `<tr data-key="${esc(i.key)}"><td style="width:34px"><input type="checkbox" class="ls-ck" data-k="${esc(i.key)}" ${UI.sel.has(i.key) ? 'checked' : ''} style="width:18px;height:18px"></td><td class="mono">${esc(i.key)}</td><td><b>${esc(i.alias || i.name)}</b><div class="small muted">${esc(i.name)}${i.model ? '・' + esc(i.model) : ''}</div>${pendChips(i) ? `<div class="row" style="gap:4px;margin-top:3px">${pendChips(i)}</div>` : ''}</td>
       <td>${esc(loc(i))}${i.spot ? `<div class="small hl">${esc(i.spot)}</div>` : ''}</td><td>${esc(i.keeper)}</td><td class="small">${esc(fmtBuy(i.buy))}${isOverdue(i) ? '<br><span class="chip gold">逾年限</span>' : ''}</td>
-      <td class="num">${money(i.value)}</td><td>${statusChip(i)}</td><td>${i.label === '需補貼' ? '<span class="chip warn">需補貼</span>' : i.label === '完好' ? '<span class="chip ok">完好</span>' : '<span class="muted small">—</span>'}</td><td>${hasPhoto(i) ? '<span class="chip acc">有</span>' : '<span class="muted small">—</span>'}</td></tr>`).join('') || `<tr><td colspan="10"><div class="empty">沒有符合的項目</div></td></tr>`;
+      <td class="num">${money(i.value)}</td><td>${statusChip(i)}</td><td>${i.label === '需補貼' ? '<span class="chip warn">需補貼</span>' : i.label === '完好' ? '<span class="chip ok">完好</span>' : '<span class="muted small">—</span>'}</td><td><span class="chip ${hasItemPhoto(i) ? 'acc' : ''}">物</span> <span class="chip ${hasLabelPhoto(i) ? 'acc' : ''}">標</span></td></tr>`).join('') || `<tr><td colspan="10"><div class="empty">沒有符合的項目</div></td></tr>`;
     bar();
   };
   v.innerHTML = `

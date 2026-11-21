@@ -4,3 +4,4 @@
 *.csv
 *.json
 *.pdf
+!manifest.webmanifest

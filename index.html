@@ -351,7 +351,7 @@ const saveState = (() => {
     try { await DB.put('kv', 'state', JSON.parse(JSON.stringify(S))); setSave('ok'); }
     catch (e) { console.error(e); setSave('err'); }
   }, 350);
-  return () => { setSave('busy'); doSave(); };
+  return (touch = true) => { if (touch) S.updatedAt = new Date().toISOString(); setSave('busy'); doSave(); };
 })();
 function setSave(st) {
   const el = $('#savest'); if (!el) return;
@@ -905,7 +905,7 @@ function shell() {
     if (VIEW === 'check') return checkScan();
     Scan.open({ title: '掃條碼查詢', onCode: c => resolveCode(c, it => openItem(it.key)) });
   };
-  $('#top-theme').onclick = () => { const cur = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; S.settings.theme = cur; applyTheme(); saveState(); };
+  $('#top-theme').onclick = () => { const cur = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; S.settings.theme = cur; applyTheme(); saveState(false); };
   setSave('ok');
 }
 function applyTheme() {
@@ -927,14 +927,16 @@ window.addEventListener('hashchange', () => route());
 function importCard() {
   return `<div class="card"><h2>匯入盤點清冊</h2><p class="sub">把財產、物品、非消耗品三份 Excel（.xls／.xlsx）一起拖進來；全分局清冊會自動篩出本單位。</p>
     <label class="drop" id="drop">${ic('up')}<div class="big">拖曳檔案到這裡，或點一下選擇</div><div class="small muted">支援一次選多個檔案</div>
-    <input type="file" id="imp-file" accept=".xls,.xlsx,.csv" multiple hidden></label></div>`;
+    <input type="file" id="imp-file" accept=".xls,.xlsx,.csv" multiple hidden></label>
+    <div class="row" style="margin-top:14px"><span class="small muted grow">手機上已經盤過了？</span><label class="btn">${ic('down')}從手機傳來的備份檔還原<input type="file" id="imp-res" accept=".json,application/json" hidden></label></div></div>`;
 }
 function wireImport(root) {
   const d = $('#drop', root); if (!d) return;
   $('#imp-file', root).addEventListener('change', e => { startImport(e.target.files); e.target.value = ''; });
+  const ir = $('#imp-res', root); if (ir) ir.addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; f && restore(f); });
   ['dragenter', 'dragover'].forEach(ev => d.addEventListener(ev, e => { e.preventDefault(); d.classList.add('over'); }));
   ['dragleave', 'drop'].forEach(ev => d.addEventListener(ev, e => { e.preventDefault(); d.classList.remove('over'); }));
-  d.addEventListener('drop', e => startImport(e.dataTransfer.files));
+  d.addEventListener('drop', e => { const fs = [...e.dataTransfer.files]; const j = fs.find(f => /\.json$/i.test(f.name)); if (j) return restore(j); startImport(fs); });
 }
 
 /* ---- 總覽 ---- */
@@ -967,6 +969,8 @@ function renderDash() {
       <div class="kpi gold click" data-go="逾年限"><div class="k">已逾使用年限的財產（可評估報廢）</div><div class="v">${s.overdue}<small>件</small></div><div class="d">東西少了，每年要盤的就少了</div></div>
       <div class="kpi click" id="go-audit"><div class="k">下一場抽查</div>${nextAudit ? `<div class="v" style="font-size:20px;margin-top:8px">${esc(nextAudit.name)}</div><div class="d">${esc(nextAudit.date || '')}・${nextAudit.entries.filter(e => e.prep).length}/${nextAudit.entries.length} 已預先確認</div>` : `<div class="v" style="font-size:18px;margin-top:8px;color:var(--muted)">尚未建立</div><div class="d">收到抽查清單後，到「抽查」貼上</div>`}</div>
     </div>
+    <div class="card" style="margin-top:14px;padding:14px 18px"><div class="row"><div class="grow"><b>手機 ⇄ 電腦</b> <span class="chip ${backupInfo().stale ? 'warn' : 'ok'}" style="margin-left:6px">${backupInfo().txt}${backupInfo().stale && S.lastBackupAt ? '・之後有修改，記得再傳' : ''}</span>
+      <div class="small muted">在手機盤點，要列印時把備份傳到電腦「輸出 → 從備份檔還原」。</div></div><button class="btn" id="dash-bak">${ic('up')}傳到電腦</button></div></div>
     <div class="sec-title">各清冊</div>
     <div class="grid g3">${tStats.map(([t, x]) => `<div class="kpi"><div class="k">${TYPE_LABEL[t]}</div><div class="v">${x.done}<small>/ ${x.total}</small></div><div class="bar" style="margin-top:8px"><i class="b-ok" style="width:${x.ok / x.total * 100}%"></i><i class="b-bad" style="width:${x.bad / x.total * 100}%"></i></div></div>`).join('')}</div>
     <div class="sec-title">各存置地點進度</div>
@@ -978,6 +982,7 @@ function renderDash() {
     const g = e.target.closest('[data-go]'); if (g) { UI.listFlag = g.dataset.go; UI.listSt = ''; UI.listQ = ''; UI.listType = ''; location.hash = '#list'; return; }
     const r = e.target.closest('[data-room]'); if (r) { UI.room = r.dataset.room; location.hash = '#check'; return; }
     if (e.target.closest('#go-audit')) location.hash = '#audit';
+    if (e.target.closest('#dash-bak')) backup();
   };
 }
 
@@ -1189,8 +1194,10 @@ function renderOut() {
       <div class="row"><button class="btn" id="o-index">${ic('out')}列印位置索引（含照片）</button><button class="btn" id="o-index2">列印位置索引（不含照片，較省紙）</button></div></div>
     <div class="card"><h2>待處理清單</h2><p class="sub">不符、標籤需補貼、逾年限可評估報廢的財產。</p>
       <div class="row"><button class="btn" id="o-todo">${ic('out')}列印待處理清單</button><button class="btn" id="o-over">${ic('out')}列印逾年限財產（${s.overdue}）</button></div></div>
-    <div class="card"><h2>備份與搬移</h2><p class="sub">資料只存在這個瀏覽器。建議每次盤完備份一次；換電腦或要在手機用時，用備份檔還原即可（含照片）。</p>
-      <div class="row"><button class="btn pri" id="o-bak">${ic('down')}下載備份檔</button><label class="btn">${ic('up')}從備份檔還原<input type="file" id="o-res" accept=".json,.pdbak" hidden></label></div></div>`;
+    <div class="card"><h2>手機 ⇄ 電腦</h2><p class="sub">建議在手機上盤點、拍照、抽查；要列印時把備份傳到電腦還原。還原會<b>整份取代</b>電腦上的資料，所以請以手機為準，不要兩邊各改各的。</p>
+      <div class="row"><span class="chip ${backupInfo().stale ? 'warn' : 'ok'}">${backupInfo().txt}${backupInfo().stale && S.lastBackupAt ? '・之後有修改' : ''}</span></div>
+      <div class="row" style="margin-top:12px"><button class="btn pri" id="o-bak">${ic('up')}傳到電腦（分享／下載備份）</button><label class="btn">${ic('down')}從備份檔還原<input type="file" id="o-res" accept=".json,application/json" hidden></label></div>
+      <label class="drop hide-m" id="o-drop" style="margin-top:12px;padding:18px">把手機傳來的備份檔拖到這裡還原</label></div>`;
   v.onclick = e => {
     const p = e.target.closest('[data-print]'); if (p) return printRecord(p.dataset.print);
     if (e.target.closest('#o-xlsx')) return exportXlsx();
@@ -1200,6 +1207,8 @@ function renderOut() {
     if (e.target.closest('#o-over')) return printOverdue();
     if (e.target.closest('#o-bak')) return backup();
   };
+  const od = $('#o-drop');
+  if (od) { ['dragenter', 'dragover'].forEach(ev => od.addEventListener(ev, e => { e.preventDefault(); od.classList.add('over'); })); ['dragleave', 'drop'].forEach(ev => od.addEventListener(ev, e => { e.preventDefault(); od.classList.remove('over'); })); od.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; f && restore(f); }); }
   $('#o-res').onchange = e => { const f = e.target.files[0]; e.target.value = ''; f && restore(f); };
 }
 const resultMark = it => it.status === '相符' ? '■帳物相符 □不符' : it.status === '不符' ? `□帳物相符 ■不符${it.issue ? '（' + it.issue + '）' : ''}` : '□帳物相符 □不符';
@@ -1297,20 +1306,42 @@ function exportXlsx() {
   XLSX.writeFile(wb, `${S.settings.year}年度盤點紀錄_${S.settings.unitName || S.settings.unitKw}_${today()}.xlsx`);
 }
 function download(name, blob) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500); }
+function backupInfo() {
+  if (!S.lastBackupAt) return { txt: '尚未備份過', stale: S.items.length > 0 };
+  const stale = S.updatedAt && S.updatedAt > S.lastBackupAt;
+  return { txt: `上次備份 ${fmtTime(S.lastBackupAt)}`, stale };
+}
 async function backup() {
-  toast('打包中…');
+  const m = openModal({ title: '傳到電腦', body: `<div id="bk-body" class="empty">打包中…</div>`, foot: '<button class="btn" data-close>關閉</button>' });
   const photos = {}; for (const k of photoKeys) { const u = await getPhoto(k); if (u) photos[k] = u; }
-  download(`財產盤點備份_${S.settings.unitName || S.settings.unitKw}_${today()}.json`, new Blob([JSON.stringify({ app: 'prop-inventory', v: 1, at: new Date().toISOString(), state: S, photos })], { type: 'application/json' }));
+  const at = new Date().toISOString();
+  const name = `財產盤點備份_${S.settings.unitName || S.settings.unitKw}_${today()}_${new Date().toTimeString().slice(0, 5).replace(':', '')}.json`;
+  const blob = new Blob([JSON.stringify({ app: 'prop-inventory', v: 1, at, state: S, photos })], { type: 'application/json' });
+  const file = new File([blob], name, { type: 'application/json' });
+  let canShare = false; try { canShare = !!(navigator.canShare && navigator.canShare({ files: [file] })); } catch (e) {}
+  const done = () => { S.lastBackupAt = at; saveState(false); if (VIEW === 'dash' || VIEW === 'out') route(true); };
+  const mb = (blob.size / 1048576).toFixed(1);
+  $('#bk-body', m).className = '';
+  $('#bk-body', m).innerHTML = `<div class="note" style="margin-bottom:14px">備份檔已準備好：${S.items.length} 件、照片 ${Object.keys(photos).length} 張、約 ${mb} MB</div>
+    <ol class="list-plain small muted" style="margin-bottom:16px"><li>${canShare ? '按「分享」→ 選 LINE（傳給自己或 Keep 筆記）或 email' : '按「下載」存下備份檔，再用 LINE／email 傳到電腦'}</li><li>電腦開啟本系統 →「輸出」→「從備份檔還原」，選這個檔案</li></ol>
+    ${Number(mb) > 25 ? '<div class="note warn" style="margin-bottom:12px">檔案較大，email 可能寄不出去，建議用 LINE 或雲端硬碟傳。</div>' : ''}
+    <div class="row">${canShare ? `<button class="btn pri lg" id="bk-share">${ic('up')}分享（LINE／email）</button>` : ''}<button class="btn ${canShare ? '' : 'pri lg'}" id="bk-dl">${ic('down')}下載備份檔</button></div>`;
+  $('#bk-dl', m).onclick = () => { download(name, blob); done(); toast('已下載備份檔', 'ok'); };
+  const sh = $('#bk-share', m);
+  if (sh) sh.onclick = async () => {
+    try { await navigator.share({ files: [file], title: '財產盤點備份', text: name }); done(); toast('已分享備份檔', 'ok'); }
+    catch (e) { if (e.name !== 'AbortError') toast('分享失敗，請改用下載：' + e.message, 'bad'); }
+  };
 }
 async function restore(f) {
   try {
     const d = JSON.parse(await f.text());
     if (d.app !== 'prop-inventory' || !d.state) throw new Error('不是本系統的備份檔');
     if (!(await ask(`用備份檔（${fmtTime(d.at)}）取代目前資料？<br>共 ${d.state.items.length} 件、照片 ${Object.keys(d.photos || {}).length} 張。`, { ok: '還原', danger: true }))) return;
-    S = Object.assign(freshState(), d.state); S.settings = Object.assign(freshState().settings, d.state.settings); S.changes = S.changes || [];
+    S = Object.assign(freshState(), d.state); S.settings = Object.assign(freshState().settings, d.state.settings); S.changes = S.changes || []; S.lastBackupAt = d.at; S.updatedAt = d.at;
     await DB.clear('photos'); photoCache.clear(); photoKeys = new Set();
     for (const [k, u] of Object.entries(d.photos || {})) await setPhoto(k, u);
-    refreshIndex(); saveState(); applyTheme(); toast('還原完成', 'ok'); location.hash = '#dash'; route();
+    refreshIndex(); saveState(false); applyTheme(); toast(`還原完成（${fmtTime(d.at)} 的備份）`, 'ok'); location.hash = '#dash'; route();
   } catch (e) { toast('還原失敗：' + e.message, 'bad'); }
 }
 
@@ -1338,7 +1369,7 @@ function renderSet() {
   wireImport(v);
   $('#s-name').oninput = e => { s.unitName = norm(e.target.value); saveState(); $('#unit-name').textContent = `${s.unitName}・${s.year} 年度`; };
   $('#s-year').onchange = e => { s.year = Number(e.target.value) || rocNow(); saveState(); route(true); };
-  $('#s-theme').onchange = e => { s.theme = e.target.value; applyTheme(); saveState(); };
+  $('#s-theme').onchange = e => { s.theme = e.target.value; applyTheme(); saveState(false); };
   v.addEventListener('input', debounce(e => {
     const inp = e.target.closest('[data-alias]'); if (!inp) return;
     const k = inp.dataset.alias, val = norm(inp.value);

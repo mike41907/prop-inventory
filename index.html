@@ -563,7 +563,7 @@ async function startImport(files) {
       fresh.forEach(it => {
         if (seen.has(it.key)) return; seen.add(it.key);
         const o = old.get(it.key);
-        if (o) { kept++; ['status', 'issue', 'checkedAt', 'label', 'spot', 'note', 'barcodes'].forEach(k => it[k] = o[k]); if (o.scrapped) it.scrapped = true; if (o.keeperBefore && o.keeper !== it.keeper) { it.keeperBefore = o.keeperBefore; it.keeper = o.keeper; } }
+        if (o) { kept++; ['status', 'issue', 'checkedAt', 'label', 'spot', 'note', 'barcodes'].forEach(k => it[k] = o[k]); if (o.scrapped) it.scrapped = true; if (o.keeperBefore && o.keeper !== it.keeper && it.keeper === o.keeperBefore) { it.keeperBefore = o.keeperBefore; it.keeper = o.keeper; } if (o.placeBefore && o.place !== it.place && it.place === o.placeBefore) { it.placeBefore = o.placeBefore; it.place = o.place; } }
         merged.push(it);
       });
       const removed = [...old.keys()].filter(k => !seen.has(k)).length;
@@ -849,7 +849,7 @@ function openItem(key) {
         <div class="field"><label class="f">備註</label><textarea class="in" id="d-note" style="min-height:90px;font-family:var(--font)" placeholder="例如：已移到 2 樓、等待報廢、借給某同仁">${esc(it.note)}</textarea></div>
         <button class="btn sm" id="d-bind">${ic('scan')}掃這件的條碼來綁定</button>
         <hr class="sep"><label class="f">列入異動清冊 ${pendChips(it)}</label>
-        <div class="row"><button class="btn sm" data-addchg="label">${ic('tag')}標籤補貼</button><button class="btn sm" data-addchg="scrap">${ic('trash')}報廢</button><button class="btn sm" data-addchg="transfer">${ic('swap')}改保管人</button></div>
+        <div class="row"><button class="btn sm" data-addchg="label">${ic('tag')}標籤補貼</button><button class="btn sm" data-addchg="scrap">${ic('trash')}報廢</button><button class="btn sm" data-addchg="move">${ic('pin')}改地點</button><button class="btn sm" data-addchg="transfer">${ic('swap')}改保管人</button></div>
       </div></div>`,
     foot: `<button class="btn pri" data-close>完成</button>`,
     onClose: () => route(true),
@@ -1405,9 +1405,10 @@ function renderSet() {
 const CHG = {
   label: { t: '標籤補貼', title: '財產標籤補貼清冊', ic: 'tag', reasons: ['脫落', '破損', '字跡模糊', '遺失'], done: '標籤已補貼' },
   scrap: { t: '報廢', title: '財產報廢清冊', ic: 'trash', reasons: ['已逾使用年限且損壞不堪使用', '故障無修復價值', '老舊效能不足不敷使用', '其他'], done: '已報廢（待除帳）' },
+  move: { t: '存置地點變更', title: '財產存置地點異動清冊', ic: 'pin', reasons: ['辦公室調整', '搬遷', '業務需要', '其他'], done: '存置地點已變更' },
   transfer: { t: '保管人變更', title: '財產保管人異動清冊', ic: 'swap', reasons: ['原保管人調職', '業務調整', '原保管人退休／離職', '其他'], done: '保管人已變更' },
 };
-const CHG_ORDER = ['label', 'scrap', 'transfer'];
+const CHG_ORDER = ['label', 'scrap', 'move', 'transfer'];
 let PEND = new Map();
 function refreshPend() {
   PEND = new Map();
@@ -1423,7 +1424,7 @@ function nextNo(type) {
 }
 function newRow(type, key) {
   const it = KEYMAP.get(key) || {};
-  return { key, reason: type === 'label' ? '脫落' : type === 'scrap' ? (isOverdue(it) ? CHG.scrap.reasons[0] : '') : CHG.transfer.reasons[0], newKeeper: '', newPlace: '', note: '' };
+  return { key, reason: type === 'label' ? '脫落' : type === 'scrap' ? (isOverdue(it) ? CHG.scrap.reasons[0] : '') : CHG[type].reasons[0], newKeeper: '', newPlace: '', newSpot: '', note: '' };
 }
 function newChange(type, keys) {
   const c = { id: uid(), type, no: nextNo(type), date: today(), status: '草稿', createdAt: new Date().toISOString(), rows: [] };
@@ -1459,11 +1460,11 @@ function keeperList() {
 /* 多選挑項目 */
 function multiPick({ type, title, onDone, preKeys = [] }) {
   const st = { src: type === 'label' ? '標籤需補貼' : type === 'scrap' ? '逾年限' : '', keeper: '', q: '', sel: new Set(preKeys) };
-  const srcs = { label: ['標籤需補貼', '標籤未確認', '全部'], scrap: ['逾年限', '盤點不符', '全部'], transfer: ['全部'] }[type];
+  const srcs = { label: ['標籤需補貼', '標籤未確認', '全部'], scrap: ['逾年限', '盤點不符', '全部'], transfer: ['全部'], move: ['全部'] }[type];
   const m = openModal({
     title, wide: true,
     body: `<div class="row" style="margin-bottom:10px">
-        ${type === 'transfer' ? `<select class="in" id="mp-keeper" style="width:auto"><option value="">選擇要移出的保管人（調走的同仁）</option>${keeperList().map(([k, n]) => `<option value="${esc(k)}">${esc(k)}（${n} 件）</option>`).join('')}</select>` : `<div class="seg" id="mp-src">${srcs.map(s => `<button data-s="${s}" class="${s === st.src ? 'on' : ''}">${s}</button>`).join('')}</div>`}
+        ${type === 'move' ? `<select class="in" id="mp-loc" style="width:auto"><option value="">選擇原本的存置地點（整間搬走時用）</option>${rooms().map(x => `<option value="${esc(x.name)}">${esc(x.name)}（${x.list.length} 件）</option>`).join('')}</select>` : type === 'transfer' ? `<select class="in" id="mp-keeper" style="width:auto"><option value="">選擇要移出的保管人（調走的同仁）</option>${keeperList().map(([k, n]) => `<option value="${esc(k)}">${esc(k)}（${n} 件）</option>`).join('')}</select>` : `<div class="seg" id="mp-src">${srcs.map(s => `<button data-s="${s}" class="${s === st.src ? 'on' : ''}">${s}</button>`).join('')}</div>`}
         <div class="search grow" style="min-width:200px"><svg class="ic" viewBox="0 0 24 24">${IC.search}</svg><input class="in" id="mp-q" placeholder="搜尋編號、名稱、位置…" style="height:40px;font-size:15px"></div></div>
       <div class="row" style="margin-bottom:10px"><button class="btn sm" id="mp-all">全選目前列表</button><button class="btn sm" id="mp-none">清除選取</button><span class="chip acc" id="mp-cnt"></span><span class="small muted" id="mp-shown"></span></div>
       <div class="items" id="mp-list" style="max-height:52vh;overflow:auto"></div>`,
@@ -1472,6 +1473,7 @@ function multiPick({ type, title, onDone, preKeys = [] }) {
   const list = () => {
     let l = st.q ? searchItems(st.q, 9999) : S.items;
     if (type === 'transfer') { if (st.keeper) l = l.filter(i => i.keeper === st.keeper); }
+    else if (type === 'move') { if (st.loc) l = l.filter(i => loc(i) === st.loc); }
     else if (st.src === '標籤需補貼') l = l.filter(i => i.label === '需補貼');
     else if (st.src === '標籤未確認') l = l.filter(i => i.label === '未確認');
     else if (st.src === '逾年限') l = l.filter(isOverdue);
@@ -1489,6 +1491,7 @@ function multiPick({ type, title, onDone, preKeys = [] }) {
   $('#mp-list', m).addEventListener('change', e => { const k = e.target.dataset.k; if (!k) return; e.target.checked ? st.sel.add(k) : st.sel.delete(k); cnt(); });
   $('#mp-q', m).addEventListener('input', debounce(e => { st.q = e.target.value; draw(); }, 150));
   $('#mp-src', m)?.addEventListener('click', e => { const b = e.target.closest('[data-s]'); if (!b) return; st.src = b.dataset.s; $$('#mp-src button', m).forEach(x => x.classList.toggle('on', x === b)); draw(); });
+  $('#mp-loc', m)?.addEventListener('change', e => { st.loc = e.target.value; draw(); });
   $('#mp-keeper', m)?.addEventListener('change', e => { st.keeper = e.target.value; if (st.keeper) list().forEach(i => st.sel.add(i.key)); draw(); });
   $('#mp-all', m).onclick = () => { list().forEach(i => st.sel.add(i.key)); draw(); };
   $('#mp-none', m).onclick = () => { st.sel.clear(); draw(); };
@@ -1511,9 +1514,10 @@ function renderChg() {
   const lbl = S.items.filter(i => i.label === '需補貼').length;
   v.innerHTML = `
     <div class="card"><h2>產生異動清冊</h2><p class="sub">勾選要處理的東西，系統產生清冊（可列印、匯出 Excel）交給財產總承辦。處理完按「完成」，系統裡的資料會跟著更新。</p>
-      <div class="grid g3">
+      <div class="grid g4">
         <div class="kpi click" data-new="label"><div class="k">${ic('tag')} 標籤補貼清冊</div><div class="v" style="font-size:22px">標籤脫落／破損</div><div class="d">目前標記「需補貼」${lbl} 件</div></div>
         <div class="kpi click" data-new="scrap"><div class="k">${ic('trash')} 報廢清冊</div><div class="v" style="font-size:22px">要報廢的財產</div><div class="d">已逾使用年限 ${s.overdue} 件可挑選</div></div>
+        <div class="kpi click" data-new="move"><div class="k">${ic('pin')} 存置地點變更清冊</div><div class="v" style="font-size:22px">東西搬位置</div><div class="d">保管人不變，只改放置地點</div></div>
         <div class="kpi click" data-new="transfer"><div class="k">${ic('swap')} 保管人變更清冊</div><div class="v" style="font-size:22px">同仁調走</div><div class="d">選人 → 自動帶出他保管的全部東西</div></div>
       </div></div>
     <div class="sec-title">清冊紀錄</div>
@@ -1530,7 +1534,8 @@ function chgCols(type) {
   const base = [['序號', (r, i, n) => n + 1], ['財產編號', (r, i) => i.key], ['名稱', (r, i) => i.name], ['別名／型式', (r, i) => [i.alias, i.model].filter(Boolean).join('／')]];
   if (type === 'label') return [...base, ['存置地點', (r, i) => loc(i)], ['精確位置', (r, i) => i.spot], ['保管人', (r, i) => i.keeper], ['標籤狀況', r => r.reason], ['備註', r => r.note]];
   if (type === 'scrap') return [...base, ['廠牌', (r, i) => i.brand], ['購置日期', (r, i) => fmtBuy(i.buy)], ['年限', (r, i) => i.life], ['已使用', (r, i) => { const y = rocYear(i.buy); return y ? `${S.settings.year - y}年` : ''; }], ['數量', (r, i) => i.qty], ['單位', (r, i) => i.unit], ['原值', (r, i) => money(i.value)], ['存置地點', (r, i) => loc(i)], ['保管人', (r, i) => i.keeper], ['報廢原因', r => r.reason], ['備註', r => r.note]];
-  return [...base, ['存置地點', (r, i) => loc(i)], ['原保管人', (r, i) => i.keeperBefore && r.applied ? i.keeperBefore : i.keeper], ['新保管人', r => r.newKeeper], ['新存置地點', r => r.newPlace], ['異動原因', r => r.reason], ['備註', r => r.note]];
+  if (type === 'move') return [...base, ['保管人', (r, i) => i.keeper], ['原存置地點', (r, i) => r.applied ? r.oldPlace : loc(i)], ['原精確位置', (r, i) => r.applied ? r.oldSpot : i.spot], ['新存置地點', r => r.newPlace], ['新精確位置', r => r.newSpot], ['異動原因', r => r.reason], ['備註', r => r.note]];
+  return [...base, ['存置地點', (r, i) => r.applied && r.oldPlace ? r.oldPlace : loc(i)], ['原保管人', (r, i) => r.applied ? (r.oldKeeper || i.keeperBefore) : i.keeper], ['新保管人', r => r.newKeeper], ['新存置地點', r => r.newPlace], ['異動原因', r => r.reason], ['備註', r => r.note]];
 }
 function renderChgDetail(c) {
   const v = $('#view'); const T = CHG[c.type]; const done = c.status === '已完成';
@@ -1545,6 +1550,9 @@ function renderChgDetail(c) {
     if (c.type === 'transfer') return `<td><input class="in" data-i="${idx}" data-f="newKeeper" value="${esc(r.newKeeper)}" list="dl-keep" placeholder="新保管人" style="min-width:100px;padding:6px 9px" ${dis}></td>
       <td><input class="in" data-i="${idx}" data-f="newPlace" value="${esc(r.newPlace)}" list="dl-place" placeholder="不變免填" style="min-width:110px;padding:6px 9px" ${dis}></td>
       <td><input class="in" data-i="${idx}" data-f="reason" value="${esc(r.reason)}" list="dl-reason" style="min-width:110px;padding:6px 9px" ${dis}></td>`;
+    if (c.type === 'move') return `<td><input class="in" data-i="${idx}" data-f="newPlace" value="${esc(r.newPlace)}" list="dl-place" placeholder="新存置地點" style="min-width:120px;padding:6px 9px" ${dis}></td>
+      <td><input class="in" data-i="${idx}" data-f="newSpot" value="${esc(r.newSpot)}" list="dl-spot" placeholder="櫃子、層架（選填）" style="min-width:130px;padding:6px 9px" ${dis}></td>
+      <td><input class="in" data-i="${idx}" data-f="reason" value="${esc(r.reason)}" list="dl-reason" style="min-width:100px;padding:6px 9px" ${dis}></td>`;
     return `<td><input class="in" data-i="${idx}" data-f="reason" value="${esc(r.reason)}" list="dl-reason" style="min-width:${c.type === 'scrap' ? 180 : 90}px;padding:6px 9px" ${dis}></td>`;
   };
   v.innerHTML = `
@@ -1562,23 +1570,27 @@ function renderChgDetail(c) {
       ${!done && c.type === 'transfer' ? `<hr class="sep"><div class="row"><b class="small">一次套用到全部：</b>
         <input class="in" id="cg-bk" list="dl-keep" placeholder="新保管人" style="width:150px"><input class="in" id="cg-bp" list="dl-place" placeholder="新存置地點（不變免填）" style="width:200px">
         <input class="in" id="cg-br" list="dl-reason" placeholder="異動原因" style="width:160px"><button class="btn pri sm" id="cg-batch">套用</button></div>` : ''}
-      ${!done && c.type !== 'transfer' ? `<hr class="sep"><div class="row"><b class="small">${c.type === 'scrap' ? '報廢原因' : '標籤狀況'}一次套用：</b><input class="in" id="cg-br" list="dl-reason" style="width:240px"><button class="btn pri sm" id="cg-batch">套用</button></div>` : ''}
+      ${!done && c.type === 'move' ? `<hr class="sep"><div class="row"><b class="small">一次套用到全部：</b>
+        <input class="in" id="cg-bp" list="dl-place" placeholder="新存置地點" style="width:180px"><input class="in" id="cg-bs" list="dl-spot" placeholder="新精確位置（選填）" style="width:180px">
+        <input class="in" id="cg-br" list="dl-reason" placeholder="異動原因" style="width:150px"><button class="btn pri sm" id="cg-batch">套用</button></div>` : ''}
+      ${!done && c.type !== 'transfer' && c.type !== 'move' ? `<hr class="sep"><div class="row"><b class="small">${c.type === 'scrap' ? '報廢原因' : '標籤狀況'}一次套用：</b><input class="in" id="cg-br" list="dl-reason" style="width:240px"><button class="btn pri sm" id="cg-batch">套用</button></div>` : ''}
     </div>
     <datalist id="dl-keep">${keepers.map(k => `<option value="${esc(k)}">`).join('')}</datalist>
     <datalist id="dl-place">${places.map(k => `<option value="${esc(k)}">`).join('')}</datalist>
+    <datalist id="dl-spot">${[...new Set(S.items.map(i => i.spot).filter(Boolean))].map(k => `<option value="${esc(k)}">`).join('')}</datalist>
     <datalist id="dl-reason">${T.reasons.map(k => `<option value="${esc(k)}">`).join('')}</datalist>
     <div class="row" style="margin:20px 0 10px"><div class="grow sec-title" style="margin:0">清冊內容（${c.rows.length} 件）</div>${done ? '' : `<button class="btn sm" id="cg-add">${ic('plus')}加入項目</button>`}</div>
-    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>財產編號</th><th>名稱</th><th>位置</th><th>${c.type === 'transfer' ? '原保管人' : '保管人'}</th>
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>財產編號</th><th>名稱</th><th>${c.type === 'move' ? '原位置' : '位置'}</th><th>${c.type === 'transfer' ? '原保管人' : '保管人'}</th>
       ${c.type === 'scrap' ? '<th>購置／年限</th><th class="num">原值</th>' : ''}
-      ${c.type === 'transfer' ? '<th>新保管人</th><th>新存置地點</th><th>異動原因</th>' : `<th>${c.type === 'scrap' ? '報廢原因' : '標籤狀況'}</th>`}<th>備註</th><th></th></tr></thead>
+      ${c.type === 'transfer' ? '<th>新保管人</th><th>新存置地點</th><th>異動原因</th>' : c.type === 'move' ? '<th>新存置地點</th><th>新精確位置</th><th>異動原因</th>' : `<th>${c.type === 'scrap' ? '報廢原因' : '標籤狀況'}</th>`}<th>備註</th><th></th></tr></thead>
       <tbody>${rows.map((x, idx) => { const { r, it } = x; if (!it) return `<tr style="cursor:default"><td>${idx + 1}</td><td class="mono">${esc(r.key)}</td><td colspan="9" class="muted">此項已不在目前清冊中</td></tr>`;
         return `<tr style="cursor:default"><td>${idx + 1}</td><td class="mono"><a href="javascript:void 0" data-open="${esc(it.key)}">${esc(it.key)}</a></td><td><b>${esc(it.alias || it.name)}</b><div class="small muted">${esc(it.name)}${it.model ? '・' + esc(it.model) : ''}</div></td>
-        <td>${esc(loc(it))}${it.spot ? `<div class="small hl">${esc(it.spot)}</div>` : ''}</td><td>${esc(done && c.type === 'transfer' ? (it.keeperBefore || '') : it.keeper)}</td>
+        <td>${esc(r.applied && r.oldPlace ? r.oldPlace : loc(it))}${(r.applied ? r.oldSpot : it.spot) ? `<div class="small hl">${esc(r.applied ? r.oldSpot : it.spot)}</div>` : ''}</td><td>${esc(done && c.type === 'transfer' ? (r.oldKeeper || it.keeperBefore || '') : it.keeper)}</td>
         ${c.type === 'scrap' ? `<td class="small">${esc(fmtBuy(it.buy))}<br>${esc(it.life)} 年${isOverdue(it) ? ' <span class="chip gold">逾年限</span>' : ' <span class="chip warn">未逾年限</span>'}</td><td class="num">${money(it.value)}</td>` : ''}
         ${spec(x, idx)}<td><input class="in" data-i="${idx}" data-f="note" value="${esc(r.note)}" style="min-width:100px;padding:6px 9px" ${dis}></td>
         <td>${done ? '' : `<button class="btn icon ghost sm" data-rm="${idx}" title="移出清冊">${ic('x')}</button>`}</td></tr>`; }).join('') || `<tr><td colspan="11"><div class="empty">還沒有項目，按「加入項目」</div></td></tr>`}</tbody></table></div>
     ${c.type === 'scrap' && rows.some(x => x.it && !isOverdue(x.it)) ? '<div class="note warn" style="margin-top:12px">清冊中有未逾使用年限的財產，報廢前請先跟財產總承辦確認是否符合規定。</div>' : ''}
-    <p class="small muted" style="margin-top:12px">按「處理完成」後：${c.type === 'label' ? '這些項目的標籤狀態會改成「完好」。' : c.type === 'scrap' ? '這些項目會標記「已報廢待除帳」，下次匯入新清冊時自動消失。' : '保管人（和存置地點）會改成新的，並在備註留下異動紀錄。'}</p>`;
+    <p class="small muted" style="margin-top:12px">按「處理完成」後：${c.type === 'label' ? '這些項目的標籤狀態會改成「完好」。' : c.type === 'move' ? '存置地點和精確位置會改成新的，並在備註留下異動紀錄。' : c.type === 'scrap' ? '這些項目會標記「已報廢待除帳」，下次匯入新清冊時自動消失。' : '保管人（和存置地點）會改成新的，並在備註留下異動紀錄。'}</p>`;
   window.scrollTo(0, sy);
   v.oninput = e => { const f = e.target.dataset.f; if (!f) return; c.rows[+e.target.dataset.i][f] = e.target.value; saveState(); };
   $('#cg-date', v)?.addEventListener('change', e => { c.date = e.target.value; saveState(); });
@@ -1592,21 +1604,27 @@ function renderChgDetail(c) {
     if (e.target.closest('#cg-add')) return multiPick({ type: c.type, title: '加入項目', onDone: keys => { keys.forEach(k => { if (!c.rows.some(r => r.key === k)) c.rows.push(newRow(c.type, k)); }); saveState(); renderChgDetail(c); } });
     const rm = e.target.closest('[data-rm]'); if (rm) { c.rows.splice(+rm.dataset.rm, 1); saveState(); return renderChgDetail(c); }
     if (e.target.closest('#cg-batch')) {
-      const bk = norm($('#cg-bk', v)?.value), bp = norm($('#cg-bp', v)?.value), br = norm($('#cg-br', v)?.value);
-      c.rows.forEach(r => { if (bk) r.newKeeper = bk; if (bp) r.newPlace = bp; if (br) r.reason = br; });
+      const bk = norm($('#cg-bk', v)?.value), bp = norm($('#cg-bp', v)?.value), br = norm($('#cg-br', v)?.value), bs = norm($('#cg-bs', v)?.value);
+      c.rows.forEach(r => { if (bk) r.newKeeper = bk; if (bp) r.newPlace = bp; if (br) r.reason = br; if (bs) r.newSpot = bs; });
       saveState(); toast('已套用到全部', 'ok'); return renderChgDetail(c);
     }
     if (e.target.closest('#cg-apply')) {
       if (!c.rows.length) return toast('清冊是空的', 'bad');
       if (c.type === 'transfer' && c.rows.some(r => !norm(r.newKeeper))) return toast('還有項目沒填新保管人', 'bad');
+      if (c.type === 'move' && c.rows.some(r => !norm(r.newPlace))) return toast('還有項目沒填新存置地點', 'bad');
       if (!(await ask(`確認 ${esc(c.no)} 已處理完成（${c.rows.length} 件），更新系統裡的資料？`, { ok: '完成並更新' }))) return;
       const stamp = rocDate();
       c.rows.forEach(r => {
         const it = KEYMAP.get(r.key); if (!it) return;
         if (c.type === 'label') { it.label = '完好'; }
         if (c.type === 'scrap') { it.scrapped = true; it.note = [it.note, `${stamp} 報廢（${c.no}）`].filter(Boolean).join('；'); }
+        if (c.type === 'move') {
+          r.oldPlace = loc(it); r.oldSpot = it.spot; const np = norm(r.newPlace), ns = norm(r.newSpot);
+          it.note = [it.note, `${stamp} 存置地點 ${r.oldPlace}${r.oldSpot ? '（' + r.oldSpot + '）' : ''}→${np}${ns ? '（' + ns + '）' : ''}（${c.no}）`].filter(Boolean).join('；');
+          it.placeBefore = it.place; it.place = np; it.spot = ns;
+        }
         if (c.type === 'transfer') {
-          it.keeperBefore = it.keeper; const np = norm(r.newPlace);
+          r.oldKeeper = it.keeper; r.oldPlace = loc(it); it.keeperBefore = it.keeper; const np = norm(r.newPlace);
           it.note = [it.note, `${stamp} 保管人 ${it.keeper}→${norm(r.newKeeper)}${np ? `，地點 ${it.place}→${np}` : ''}（${c.no}）`].filter(Boolean).join('；');
           it.keeper = norm(r.newKeeper); if (np) it.place = np;
         }
@@ -1628,7 +1646,7 @@ function chgTable(c) {
   }
   return { heads: cols.map(x => x[0]), body, total };
 }
-const chgSigns = c => c.type === 'transfer' ? ['原保管人', '新保管人', '單位主管', '財產管理人員'] : ['填表人', '單位主管', '財產管理人員'];
+const chgSigns = c => c.type === 'transfer' ? ['原保管人', '新保管人', '單位主管', '財產管理人員'] : c.type === 'move' ? ['保管人', '單位主管', '財產管理人員'] : ['填表人', '單位主管', '財產管理人員'];
 function printChange(c) {
   const T = CHG[c.type]; const { heads, body, total } = chgTable(c);
   doPrint(`<h1>${esc(S.meta.asset?.titles?.[0] || S.meta.goods?.titles?.[0] || '')}</h1><h2>${esc(S.settings.unitName || S.settings.unitKw)}　${esc(T.title)}</h2>
@@ -1697,7 +1715,7 @@ function renderList(soft) {
     </div>
     <div class="card" id="ls-bar" style="display:none;padding:10px 14px;margin-bottom:12px;position:sticky;top:72px;z-index:5;border-color:var(--accent)">
       <div class="row"><b id="ls-seln" class="grow"></b><span class="small muted hide-m">產生清冊：</span>
-        <button class="btn sm" data-mk="label">${ic('tag')}標籤補貼</button><button class="btn sm" data-mk="scrap">${ic('trash')}報廢</button><button class="btn sm" data-mk="transfer">${ic('swap')}改保管人</button>
+        <button class="btn sm" data-mk="label">${ic('tag')}標籤補貼</button><button class="btn sm" data-mk="scrap">${ic('trash')}報廢</button><button class="btn sm" data-mk="move">${ic('pin')}改地點</button><button class="btn sm" data-mk="transfer">${ic('swap')}改保管人</button>
         <button class="btn sm ghost" id="ls-clear">取消選取</button></div></div>
     <div class="tbl-wrap" style="max-height:calc(100vh - 200px)"><table class="tbl"><thead><tr><th><input type="checkbox" id="ls-all" style="width:18px;height:18px" title="全選目前列表"></th><th>財產編號</th><th>名稱</th><th>位置</th><th>保管人</th><th>購置</th><th class="num">原值</th><th>盤點</th><th>標籤</th><th>照片</th></tr></thead><tbody id="ls-body"></tbody></table></div>`;
   table();
